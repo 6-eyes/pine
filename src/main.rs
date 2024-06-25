@@ -1003,7 +1003,8 @@ mod theme {
 
 mod core {
     use std::{fs, io::{self, Write}, sync::Arc};
-    use aes::{cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit}, Aes128};
+    use aes::{cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit}, Aes128, Block};
+    use block_padding::{Padding, Pkcs7};
     use pbkdf2::pbkdf2_hmac_array;
     use crate::Secret;
 
@@ -1034,22 +1035,15 @@ mod core {
         let content = creds.into_iter().map(|(username, secret, description)| {
             format!("{},{},{}", username, secret, description)
         }).collect::<Vec::<String>>().join("\n");
-        let mut content_iter = content.as_bytes().chunks_exact(16);
-        let mut buffer = Vec::new();
-        let mut encrypt_and_push = |block| {
-            let mut block_array = GenericArray::from_slice(block).to_owned();
+
+        let buffer = content.as_bytes().chunks(16).flat_map(|block| {
+            let len = block.len();
+            let mut block_array: GenericArray<u8, _> = [0xff; 16].into();
+            block_array[..len].copy_from_slice(block);
+            Pkcs7::pad(&mut block_array, 16 - len);
             storage.cipher.encrypt_block(&mut block_array);
-            buffer.extend_from_slice(&block_array);
-        };
-        for block in content_iter.by_ref() {
-            encrypt_and_push(block);
-        }
-        let remainder = content_iter.remainder();
-        if !remainder.is_empty() {
-            let mut remainder = remainder.to_vec();
-            remainder.extend(std::iter::repeat(0).take(16 - remainder.len()));
-            encrypt_and_push(&remainder);
-        }
+            block.to_owned().into_iter()
+        }).collect::<Vec::<u8>>();
         fs::create_dir_all(&storage.directory)?;
         let mut file = fs::File::create(format!("{}/{}", storage.directory, storage.file_name))?;
         file.write_all(buffer.as_slice())?;
@@ -1063,7 +1057,10 @@ mod core {
         for chunk in buffer.chunks_exact(16) {
             let mut block_array = GenericArray::from_slice(chunk).to_owned();
             storage.cipher.decrypt_block(&mut block_array);
-            decrypted_buffer.extend_from_slice(&block_array);
+            match Pkcs7::unpad(&block_array) {
+                Ok(res) => decrypted_buffer.extend_from_slice(&res),
+                Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "Invalid file")),
+            };
         }
         let content = String::from_utf8_lossy(decrypted_buffer.as_slice());
         let content = content.lines().map(|buffer| {
