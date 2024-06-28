@@ -1,4 +1,5 @@
 use ::core::fmt;
+use core::StoreError;
 use std::{sync::Arc, thread::sleep, time::Duration};
 use iced::{alignment, clipboard, executor, font::Weight, widget::{button, column, container, horizontal_space, keyed_column, radio, row, text, text_editor, text_input, Column, Container, Row}, window::{self, Position}, Alignment, Application, Command, Element, Font, Length, Pixels, Settings, Size};
 
@@ -41,10 +42,10 @@ impl Application for Pine {
             toasts: vec!{ Toast { message: "Add new credential".to_string(), status: Status::Info } },
             storage: Arc::new(core::Storage::new_from_secret("    ")),
         };
-        let fetched_fn = |res| {
+        let fetched_fn = |res: Result<Vec<(String, Secret, String)>, StoreError>| {
             match res {
                 Ok(cred_list) => Message::Storage(core::StoreMessage::Fetched(cred_list)),
-                Err(_) => Message::Invalid,
+                Err(e) => Message::Invalid(e.into()),
             }
         };
         let command = Command::perform(core::fetch(Arc::clone(&pine.storage)), fetched_fn);
@@ -122,7 +123,7 @@ impl Application for Pine {
                 },
                 core::StoreMessage::Invalid => self.toast("Some error occurred", Status::Danger)
             },
-            Message::Invalid => self.toast("Some error occurred", Status::Danger),
+            Message::Invalid(e) => self.toast(e.as_str(), Status::Danger),
         };
         Command::none()
     }
@@ -203,7 +204,7 @@ impl Pine {
     }
 
     fn update_repo(&self, action: Option<CredAction>) -> Command<Message> {
-        let store_result = |res| match res {
+        let store_result = |res: Result<(), core::StoreError>| match res {
             Ok(_) => {
                 let message = match action {
                     None => core::StoreMessage::Added,
@@ -217,7 +218,7 @@ impl Pine {
                 };
                 Message::Storage(message)
             },
-            Err(_) => Message::Invalid,
+            Err(e) => Message::Invalid(e.into()),
         };
         let creds_cloned = self.cred_list.iter().map(|cred| (cred.username.0.clone(), cred.secret.clone(), cred.description.0.clone())).collect::<Vec::<(String, Secret, String)>>();
         Command::perform(core::save(Arc::clone(&self.storage), creds_cloned), store_result)
@@ -334,7 +335,7 @@ pub enum Message {
     SecretType(SecretTypeMessage),
     CloseToast(usize),
     Storage(core::StoreMessage),
-    Invalid,
+    Invalid(String),
 }
 
 #[derive(Clone, Debug, Copy, Eq, PartialEq)]
@@ -1003,8 +1004,8 @@ mod theme {
 
 mod core {
     use std::{fs, io::{self, Write}, sync::Arc};
-    use aes::{cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit}, Aes128, Block};
-    use block_padding::{Padding, Pkcs7};
+    use aes::{cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit}, Aes128};
+    // use block_padding::{Padding, Pkcs7};
     use pbkdf2::pbkdf2_hmac_array;
     use crate::Secret;
 
@@ -1031,36 +1032,58 @@ mod core {
         }
     }
 
-    pub async fn save(storage: Arc<Storage>, creds: Vec<(String, Secret, String)>) -> Result<(), io::Error> {
+    #[derive(Debug)]
+    pub enum StoreError {
+        IO(io::Error),
+        PadError,
+        UnpadError,
+    }
+
+    impl From<StoreError> for String {
+        fn from(error: StoreError) -> Self {
+            match error {
+                StoreError::IO(io_error) => io_error.to_string(),
+                StoreError::PadError => String::from("error while padding"),
+                StoreError::UnpadError => String::from("error while unpadding"),
+            }
+        }
+    }
+
+    pub async fn save(storage: Arc<Storage>, creds: Vec<(String, Secret, String)>) -> Result<(), StoreError> {
         let content = creds.into_iter().map(|(username, secret, description)| {
             format!("{},{},{}", username, secret, description)
         }).collect::<Vec::<String>>().join("\n");
 
-        let buffer = content.as_bytes().chunks(16).flat_map(|block| {
-            let len = block.len();
-            let mut block_array: GenericArray<u8, _> = [0xff; 16].into();
-            block_array[..len].copy_from_slice(block);
-            Pkcs7::pad(&mut block_array, 16 - len);
+        let mut buffer = Vec::new();
+        for chunk in content.as_bytes().chunks(16) {
+            let mut block_array: GenericArray<u8, _> = {
+                let mut padded_array = [0xff; 16];
+                let padded_block = Pkcs7::pad(chunk, 16)?;
+                padded_array.copy_from_slice(padded_block.as_slice());
+                GenericArray::from(padded_array)
+            };
             storage.cipher.encrypt_block(&mut block_array);
-            block.to_owned().into_iter()
-        }).collect::<Vec::<u8>>();
-        fs::create_dir_all(&storage.directory)?;
-        let mut file = fs::File::create(format!("{}/{}", storage.directory, storage.file_name))?;
-        file.write_all(buffer.as_slice())?;
+            buffer.extend_from_slice(block_array.as_slice());
+        }
+
+        fs::create_dir_all(&storage.directory).map_err(StoreError::IO)?;
+        let mut file = fs::File::create(format!("{}/{}", storage.directory, storage.file_name)).map_err(StoreError::IO)?;
+        file.write_all(buffer.as_slice()).map_err(StoreError::IO)?;
         Ok(())
     }
 
-    pub async fn fetch(storage: Arc<Storage>) -> Result<Vec<(String, Secret, String)>, io::Error> {
+    pub async fn fetch(storage: Arc<Storage>) -> Result<Vec<(String, Secret, String)>, StoreError> {
         const DIR: &str = ".store";
-        let buffer = fs::read(format!("{}/{}", DIR, storage.file_name))?;
+        let buffer = fs::read(format!("{}/{}", DIR, storage.file_name)).map_err(StoreError::IO)?;
         let mut decrypted_buffer: Vec<u8> = Vec::new();
-        for chunk in buffer.chunks_exact(16) {
+        for chunk in buffer.chunks(16) {
+            if chunk.len() < 16 {
+                return Err(StoreError::PadError);
+            }
             let mut block_array = GenericArray::from_slice(chunk).to_owned();
             storage.cipher.decrypt_block(&mut block_array);
-            match Pkcs7::unpad(&block_array) {
-                Ok(res) => decrypted_buffer.extend_from_slice(&res),
-                Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "Invalid file")),
-            };
+            let content = Pkcs7::unpad(&block_array)?;
+            decrypted_buffer.extend_from_slice(content);
         }
         let content = String::from_utf8_lossy(decrypted_buffer.as_slice());
         let content = content.lines().map(|buffer| {
@@ -1073,6 +1096,38 @@ mod core {
         Ok(content)
     }
 
+    struct Pkcs7;
+
+    impl Pkcs7 {
+        fn pad(block: &[u8], len: usize) -> Result<Vec<u8>, StoreError> {
+            if block.len() > 255 || len < block.len() {
+                Err(StoreError::PadError)
+            }
+            else {
+                let n = len - block.len();
+                let padded_block = block.iter().chain(std::iter::repeat(&(n as u8)).take(n)).map(u8::to_owned).collect::<Vec::<u8>>();
+                Ok(padded_block)
+            }
+        }
+
+
+        fn unpad(block: &[u8]) -> Result<&[u8], StoreError> {
+            let n = block.last().ok_or(StoreError::UnpadError)?;
+            if block.len() > u8::MAX as usize || *n == 0 || *n as usize >= block.len() {
+                Ok(block)
+            }
+            else {
+                let s = block.len() - *n as usize;
+                if block[s..].iter().any(|&v| v != *n) {
+                    Ok(block)
+                }
+                else {
+                    Ok(&block[..s])
+                }
+            }
+        }
+    }
+
     #[derive(Clone, Debug)]
     pub enum StoreMessage {
         Fetched(Vec<(String, Secret, String)>),
@@ -1080,5 +1135,40 @@ mod core {
         Deleted,
         Updated,
         Invalid,
+    }
+    
+    #[test]
+    fn unpad_empty_block() {
+        let arr: &[u8] = &[];
+        let res = Pkcs7::unpad(arr);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn unpad_block_with_length_greater_than_255() {
+        let arr = [2u8; 500];
+        let res = Pkcs7::unpad(&arr[..]);
+        assert!(res.is_ok_and(|unpadded_arr| unpadded_arr == arr));
+    }
+
+    #[test]
+    fn unpad_block_with_last_byte_0() {
+        let arr = (0..100).rev().collect::<Vec<u8>>();
+        let res = Pkcs7::unpad(arr.as_slice());
+        assert!(res.is_ok_and(|unpadded_arr| unpadded_arr == arr));
+    }
+
+    #[test]
+    fn unpad_block_with_last_byte_greater_than_length_of_array() {
+        let arr = [50u8, 51, 52];
+        let res = Pkcs7::unpad(&arr[..]);
+        assert!(res.is_ok_and(|unpadded_arr| unpadded_arr == &arr[..]));
+    }
+
+    #[test]
+    fn unpad_block_with_bytes_ne_to_unpad_length() {
+        let arr = [9, 8, 7, 6, 5, 4, 3, 10, 10, 10, 10, 10, 10, 3, 10, 10, 10];
+        let res = Pkcs7::unpad(&arr[..]);
+        assert!(res.is_ok_and(|unpadded_arr| unpadded_arr == &arr[..]));
     }
 }
