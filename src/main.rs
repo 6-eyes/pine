@@ -1,6 +1,5 @@
-use ::core::fmt;
 use core::StoreError;
-use std::{sync::Arc, thread::sleep, time::Duration};
+use std::{fmt, sync::Arc, thread::sleep, time::Duration};
 use iced::{alignment, clipboard, executor, font::Weight, widget::{button, column, container, horizontal_space, keyed_column, radio, row, text, text_editor, text_input, Column, Container, Row}, window::{self, Position}, Alignment, Application, Command, Element, Font, Length, Pixels, Settings, Size};
 
 const TITLE: &str = "pine";
@@ -11,7 +10,7 @@ fn main() -> iced::Result {
             size: Size::new(800f32, 800f32),
             resizable: true,
             decorations: true,
-            position: Position::Default,
+            position: Position::Centered,
             visible: true,
             transparent: false,
             ..Default::default()
@@ -27,6 +26,7 @@ struct Pine {
     insert_mode: InsertMode,
     toasts: Vec<Toast>,
     storage: Arc<core::Storage>,
+    fault: bool,
 }
 
 impl Application for Pine {
@@ -36,20 +36,35 @@ impl Application for Pine {
     type Theme = theme::Theme;
 
     fn new(_flags: Self::Flags) -> (Self, Command<Self::Message>) {
-        let pine = Pine {
-            cred_list: Vec::new(),
-            insert_mode: InsertMode::Disabled,
-            toasts: vec!{ Toast { message: "Add new credential".to_string(), status: Status::Info } },
-            storage: Arc::new(core::Storage::new_from_secret("    ")),
-        };
-        let fetched_fn = |res: Result<Vec<(String, Secret, String)>, StoreError>| {
-            match res {
-                Ok(cred_list) => Message::Storage(core::StoreMessage::Fetched(cred_list)),
-                Err(e) => Message::Invalid(e.into()),
-            }
-        };
-        let command = Command::perform(core::fetch(Arc::clone(&pine.storage)), fetched_fn);
-        (pine, command)
+        match core::Storage::new_from_secret("password") {
+            Ok(storage) =>  {
+                let pine = Pine {
+                    cred_list: Vec::new(),
+                    insert_mode: InsertMode::Disabled,
+                    toasts: vec!{ Toast { message: "Add new credential".to_string(), status: Status::Info } },
+                    storage: Arc::new(storage),
+                    fault: false,
+                };
+                let fetched_fn = |res: Result<Vec<(String, Secret, String)>, StoreError>| {
+                    match res {
+                        Ok(cred_list) => Message::Storage(core::StoreMessage::Fetched(cred_list)),
+                        Err(e) => Message::Invalid(e.into()),
+                    }
+                };
+                let command = Command::perform(core::fetch(Arc::clone(&pine.storage)), fetched_fn);
+                (pine, command)
+            },
+            Err(se) => {
+                let pine = Pine {
+                    cred_list: Vec::new(),
+                    insert_mode: InsertMode::Disabled,
+                    toasts: vec!{ Toast { message: se.into(), status: Status::Danger } },
+                    storage: Arc::new(core::Storage::default()),
+                    fault: true,
+                };
+                (pine, Command::none())
+            },
+        }
     }
 
     fn title(&self) -> String {
@@ -184,6 +199,7 @@ impl Pine {
                 },
                 CredAction::Save => {
                     cred.set_creds();
+                    return self.update_repo(Some(action));
                 },
                 CredAction::ToggleEdit => cred.toggle_edit(),
                 CredAction::Hide => cred.hidden = true,
@@ -294,14 +310,11 @@ impl Cred {
 
     fn update(&mut self, action: CredAction) {
         if let Some(ce) = &mut self.edit_mode {
-            if let CredAction::UsernameInput(username) = action {
-                ce.username = username;
-            }
-            else if let CredAction::SecretInput(secret) = action {
-                ce.secret.set_secret(secret);
-            }
-            else if let CredAction::DescriptionInput(description) = action {
-                ce.description.perform(description);
+            match action {
+                CredAction::UsernameInput(username) => ce.username = username,
+                CredAction::SecretInput(secret) => ce.secret.set_secret(secret),
+                CredAction::DescriptionInput(description) => ce.description.perform(description),
+                _ => unreachable!(),
             }
         }
     }
@@ -583,7 +596,7 @@ impl Description {
     }
 
     fn update(&mut self, description: text_editor::Content) {
-        self.0 = description.text();
+        description.text().trim().clone_into(&mut self.0);
     }
 }
 
@@ -1003,31 +1016,117 @@ mod theme {
 }
 
 mod core {
-    use std::{fs, io::{self, Write}, sync::Arc};
+    use std::{fs, io::{self, Write}, path, sync::Arc, time};
     use aes::{cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit}, Aes128};
-    // use block_padding::{Padding, Pkcs7};
-    use pbkdf2::pbkdf2_hmac_array;
-    use crate::Secret;
+    use rand::{Rng, RngCore};
+    use crate::{Secret, TITLE};
 
     #[derive(Debug)]
     pub struct Storage {
         cipher: Aes128,
+        directory: path::PathBuf,
         file_name: String,
-        directory: String,
+    }
+
+    impl Default for Storage {
+        fn default() -> Self {
+            Self {
+                cipher: Aes128::new(&GenericArray::from([0u8; 16])),
+                directory: path::PathBuf::default(),
+                file_name: String::default(),
+            }
+        }
     }
 
     impl Storage {
-        pub fn new_from_secret(secret: &str) -> Self {
-            const SALT: &str = "salt";
+        pub fn new_from_secret(secret: &str) -> Result<Self, StoreError> {
             const N: u32 = 100_000;
-            let key = pbkdf2_hmac_array::<sha2::Sha256, 16>(secret.as_bytes(), SALT.as_bytes(), N);
+            let directory = {
+                let home_dir = home::home_dir().unwrap_or_default();
+                if cfg!(target_os = "windows") {
+                    home_dir.join("AppData").join(TITLE.to_lowercase())
+                }
+                else if cfg!(target_os = "macos") {
+                    home_dir.join("Library").join("Application Support").join(TITLE.to_lowercase())
+                }
+                else {
+                    home_dir.join(".config").join(TITLE.to_lowercase())
+                }
+            };
+            let salt = Self::read_salt(directory.clone())?;
+            let key = pbkdf2::pbkdf2_hmac_array::<sha2::Sha256, 16>(secret.as_bytes(), salt.as_slice(), N);
             let cipher = Aes128::new(&GenericArray::from(key));
-            let file_name = "store.aes".to_string();
-            let directory = ".store".to_string();
-            Self {
+            let file_name = "localstorage.aes".to_string();
+            Ok(Self {
                 cipher,
                 file_name,
                 directory,
+            })
+        }
+
+        fn read_salt(directory: path::PathBuf) -> Result<Vec<u8>, StoreError> {
+            const SALT_EXTENTION: &str = "salt";
+            let mut rng = rand::thread_rng();
+
+            let file_name= {
+                let length = rng.gen_range(10 - SALT_EXTENTION.len()..=30 - SALT_EXTENTION.len());
+                let random = (0..length).map(|_| {
+                    let choice = rng.gen_range(0u8..3);
+                    match choice {
+                        0 => rng.gen_range('a'..='z'),
+                        1 => rng.gen_range('A'..='Z'),
+                        2 => rng.gen_range('0'..='9'),
+                        _ => unreachable!(),
+                    }
+                }).collect::<String>();
+                format!("{}{}", random, SALT_EXTENTION)
+            };
+
+            let create_new_salt_file = |c: Option<Vec<u8>>| {
+                match c {
+                    Some(content) =>  {
+                        fs::write(directory.join(file_name), content.as_slice()).map_err(StoreError::IO)?;
+                        Ok(content)
+                    },
+                    None => {
+                        let salt_len = rng.gen_range(5usize..u8::MAX as usize);
+                        let mut salt = vec!{0u8; salt_len};
+                        rng.try_fill_bytes(&mut salt).map_err(StoreError::Rand)?;
+                        fs::write(directory.join(file_name), salt.as_slice()).map_err(StoreError::IO)?;
+                        Ok(salt)
+                    }
+                }
+            };
+
+            match fs::read_dir(&directory) {
+                Ok(read_dir) => {
+                    let files = read_dir.filter_map(|file| {
+                        file.ok().and_then(|dir| {
+                            let file_name = dir.file_name().to_str().filter(|&name| name.ends_with(SALT_EXTENTION)).map(str::to_owned);
+                            let created_date = dir.metadata().and_then(|metadata| metadata.created()).ok();
+                            file_name.and_then(|name| created_date.map(|date| (name, date)))
+                        })
+                    }).collect::<Vec::<(String, time::SystemTime)>>();
+                    let latest_file = files.iter().max_by(|&a, &b| a.1.cmp(&b.1)).map(|(name, _)| name.to_owned());
+                    match latest_file {
+                        Some(name) => {
+                            let contents = fs::read(directory.join(name).to_str().unwrap_or_default()).map_err(StoreError::IO)?;
+                            files.into_iter().for_each(|(name, _)| {
+                                let path = directory.clone().join(name).to_owned();
+                                match fs::remove_file(path) {
+                                    Ok(_) => println!("file deleted"),
+                                    Err(_) => eprintln!("unable to delete file"),
+                                }
+                            });
+                            create_new_salt_file(Some(contents))
+                        },
+                        None => create_new_salt_file(None),
+                    }
+                },
+                Err(_) => {
+                    fs::create_dir(directory.clone()).map_err(StoreError::IO)?;
+                    create_new_salt_file(None)
+                },
             }
         }
     }
@@ -1035,8 +1134,10 @@ mod core {
     #[derive(Debug)]
     pub enum StoreError {
         IO(io::Error),
+        Rand(rand::Error),
         PadError,
         UnpadError,
+        InstallationError,
     }
 
     impl From<StoreError> for String {
@@ -1045,6 +1146,8 @@ mod core {
                 StoreError::IO(io_error) => io_error.to_string(),
                 StoreError::PadError => String::from("error while padding"),
                 StoreError::UnpadError => String::from("error while unpadding"),
+                StoreError::InstallationError => String::from("error while installing application"),
+                StoreError::Rand(rand_error) => rand_error.to_string(),
             }
         }
     }
@@ -1067,14 +1170,13 @@ mod core {
         }
 
         fs::create_dir_all(&storage.directory).map_err(StoreError::IO)?;
-        let mut file = fs::File::create(format!("{}/{}", storage.directory, storage.file_name)).map_err(StoreError::IO)?;
+        let mut file = fs::File::create(storage.directory.join(&storage.file_name)).map_err(StoreError::IO)?;
         file.write_all(buffer.as_slice()).map_err(StoreError::IO)?;
         Ok(())
     }
 
     pub async fn fetch(storage: Arc<Storage>) -> Result<Vec<(String, Secret, String)>, StoreError> {
-        const DIR: &str = ".store";
-        let buffer = fs::read(format!("{}/{}", DIR, storage.file_name)).map_err(StoreError::IO)?;
+        let buffer = fs::read(storage.directory.join(&storage.file_name)).map_err(StoreError::IO)?;
         let mut decrypted_buffer: Vec<u8> = Vec::new();
         for chunk in buffer.chunks(16) {
             if chunk.len() < 16 {
@@ -1109,7 +1211,6 @@ mod core {
                 Ok(padded_block)
             }
         }
-
 
         fn unpad(block: &[u8]) -> Result<&[u8], StoreError> {
             let n = block.last().ok_or(StoreError::UnpadError)?;
@@ -1170,5 +1271,88 @@ mod core {
         let arr = [9, 8, 7, 6, 5, 4, 3, 10, 10, 10, 10, 10, 10, 3, 10, 10, 10];
         let res = Pkcs7::unpad(&arr[..]);
         assert!(res.is_ok_and(|unpadded_arr| unpadded_arr == &arr[..]));
+    }
+
+    #[test]
+    fn unpad_valid_block() {
+        let arr = [42, 35, 23, 187, 34, 69, 248, 21, 231, 126, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12];
+        let res = Pkcs7::unpad(&arr[..]);
+        let expected = [42, 35, 23, 187, 34, 69, 248, 21, 231, 126];
+        assert!(res.is_ok_and(|unpadded_arr| unpadded_arr == expected));
+    }
+
+    #[test]
+    fn salt_creation() {
+        let storage = Storage::new_from_secret("my_secret");
+        assert!(storage.is_ok());
+    }
+
+    #[test]
+    fn salt_update() {
+        const SALT_EXTENTION: &str = "salt";
+        let directory = {
+            let home_dir = home::home_dir().unwrap_or_default();
+            if cfg!(target_os = "windows") {
+                home_dir.join("AppData").join(TITLE.to_lowercase())
+            }
+            else if cfg!(target_os = "macos") {
+                home_dir.join("Library").join("Application Support").join(TITLE.to_lowercase())
+            }
+            else {
+                home_dir.join(".config").join(TITLE.to_lowercase())
+            }
+        };
+
+        if let Err(_) = fs::create_dir_all(&directory) {
+            panic!("Failed to create directory");
+        }
+
+        let mut rng = rand::thread_rng();
+        let mut create_salt_file = || {
+            let file_name= {
+                let length = rng.gen_range(10 - SALT_EXTENTION.len()..=30 - SALT_EXTENTION.len());
+                let random = (0..length).map(|_| {
+                    let choice = rng.gen_range(0u8..3);
+                    match choice {
+                        0 => rng.gen_range('a'..='z'),
+                        1 => rng.gen_range('A'..='Z'),
+                        2 => rng.gen_range('0'..='9'),
+                        _ => unreachable!(),
+                    }
+                }).collect::<String>();
+                format!("{}{}", random, SALT_EXTENTION)
+            };
+            let salt_len = rng.gen_range(5usize..u8::MAX as usize);
+            let mut salt = vec!{0u8; salt_len};
+            if let Err(_) = rng.try_fill_bytes(&mut salt) {
+                panic!("error filling random bytes");
+            }
+            if let Err(_) = fs::write(directory.join(file_name), salt.as_slice()) {
+                panic!("error writing to file");
+            }
+            salt
+        };
+
+        create_salt_file();
+        std::thread::sleep(time::Duration::from_secs(1));
+        create_salt_file();
+        std::thread::sleep(time::Duration::from_secs(1));
+        create_salt_file();
+        std::thread::sleep(time::Duration::from_secs(1));
+        let content = create_salt_file();
+        std::thread::sleep(time::Duration::from_secs(1));
+
+        let storage = Storage::new_from_secret("my_secret");
+        assert!(storage.is_ok());
+
+        if let Ok(read_dir) = fs::read_dir(&directory) {
+            let files = read_dir.filter_map(|file| file.ok().and_then(|dir| dir.file_name().to_str().filter(|&name| name.ends_with(SALT_EXTENTION)).map(str::to_owned))).collect::<Vec::<String>>();
+            assert_eq!(files.len(), 1);
+            let file_content = fs::read(directory.join(files.get(0).unwrap())).expect("error reading file");
+            assert_eq!(file_content, content);
+        }
+        else {
+            panic!("error reading directory");
+        }
     }
 }
