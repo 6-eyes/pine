@@ -1,6 +1,6 @@
 use core::StoreError;
 use std::{fmt, sync::Arc, thread::sleep, time::Duration};
-use iced::{alignment, clipboard, executor, font::Weight, widget::{button, column, container, horizontal_space, keyed_column, radio, row, text, text_editor, text_input, Column, Container, Row}, window::{self, Position}, Alignment, Application, Command, Element, Font, Length, Pixels, Settings, Size};
+use iced::{alignment, clipboard, executor, font::Weight, widget::{button, column, container, horizontal_space, keyed_column, radio, row, scrollable, text, text_editor, text_input, Column, Container, Row}, window::{self, Position}, Alignment, Application, Command, Element, Font, Length, Pixels, Settings, Size};
 
 const TITLE: &str = "pine";
 
@@ -41,7 +41,7 @@ impl Application for Pine {
                 let pine = Pine {
                     cred_list: Vec::new(),
                     insert_mode: InsertMode::Disabled,
-                    toasts: vec!{ Toast { message: "Add new credential".to_string(), status: Status::Info } },
+                    toasts: Vec::new(),
                     storage: Arc::new(storage),
                     fault: false,
                 };
@@ -129,15 +129,7 @@ impl Application for Pine {
                     self.toasts.remove(i);
                 }
             },
-            Message::Storage(store_message) => match store_message {
-                core::StoreMessage::Added => self.toast("New credential added", Status::Success),
-                core::StoreMessage::Updated => self.toast("Credential updated", Status::Success),
-                core::StoreMessage::Deleted => self.toast("Credential deleted", Status::Success),
-                core::StoreMessage::Fetched(cred_list) => {
-                    self.cred_list.extend(cred_list.into_iter().map(|cred| Cred::new_from_raw(cred.0, cred.1, cred.2)));
-                },
-                core::StoreMessage::Invalid => self.toast("Some error occurred", Status::Danger)
-            },
+            Message::Storage(store_message) => self.update_store(store_message),
             Message::Invalid(e) => self.toast(e.as_str(), Status::Danger),
         };
         Command::none()
@@ -168,15 +160,15 @@ impl Application for Pine {
                         SecretInput::Pin(val) => ("pin", val.as_ref().map(u32::to_string).unwrap_or(String::default())),
                     };
                     let secret_row = row!{ text_input(secret_type, &value).secure(!message.reveal_secret).on_input(Message::SecretInput), button(button_content(Some(if message.reveal_secret {'\u{E801}'} else {'\u{E802}'}), None, Length::Shrink, None)).on_press(Message::ToggleSecretReveal), button(button_content(Some('\u{E800}'), None, Length::Shrink, Some(theme::Text::Black))).style(theme::Button::Distinct).on_press(Message::GenerateRandom) }.spacing(5);
-                    row!{ text_input("username", &message.username).on_input(Message::UsernameInput), secret_row }.spacing(20)
+                    row!{ text_input("username", &message.username).on_input(Message::UsernameInput), secret_row }.spacing(20).padding([0, 20, 0, 20])
                 };
-                let disc = text_editor(&message.description).on_action(Message::DescriptionInput);
-                let action_buttons = row!{ button(button_content(None, Some("Cancel"), Length::Fill, None)).on_press(Message::Cancel), button(button_content(None, Some("Add"), Length::Fill, None)).on_press_maybe( message.is_not_empty().then(|| Message::Add))}.spacing(20);
+                let disc = container(text_editor(&message.description).on_action(Message::DescriptionInput)).padding([0, 20, 0, 20]);
+                let action_buttons = row!{ button(button_content(None, Some("Cancel"), Length::Fill, None)).on_press(Message::Cancel), button(button_content(None, Some("Add"), Length::Fill, None)).on_press_maybe( message.is_not_empty().then(|| Message::Add))}.spacing(20).padding([0, 20, 0, 20]);
                 col.push(type_selector).push(cred_fields).push(disc).push(action_buttons)
             }
         };
-        let list = keyed_column(self.cred_list.iter().enumerate().map(|(i, cred)| (i, cred.view().map(move |ca| Message::Action(i as i32, ca))))).spacing(20);
-        let content = container(col.push(list).align_items(alignment::Alignment::Center).spacing(20).max_width(Pixels::from(800))).padding([0, 20, 0, 20]).center_x();
+        let list = scrollable(keyed_column(self.cred_list.iter().enumerate().map(|(i, cred)| (i, cred.view().map(move |ca| Message::Action(i as i32, ca))))).padding([0, 20, 20, 20]).spacing(20));
+        let content = container(col.push(list).align_items(alignment::Alignment::Center).spacing(20).max_width(Pixels::from(800)))/*.padding([0, 20, 0, 20])*/.center_x();
         display_manager::Manager::new(content, &self.toasts, Message::CloseToast).into()
     }
 
@@ -192,7 +184,7 @@ impl Pine {
 
     fn update_cred(&mut self, i: i32, action: CredAction) -> Command<Message> {
         if let Some(cred) = self.cred_list.get_mut(i as usize) {
-            match action {
+            let (command, (message, status)) = match action {
                 CredAction::Reveal => {
                     cred.hidden = false;
                     return Command::perform(Self::secret_reveal_timeout(5), move |_| Message::Action(i, CredAction::Hide));
@@ -201,18 +193,47 @@ impl Pine {
                     cred.set_creds();
                     return self.update_repo(Some(action));
                 },
-                CredAction::ToggleEdit => cred.toggle_edit(),
-                CredAction::Hide => cred.hidden = true,
-                CredAction::YankUsername => return clipboard::write(cred.username.0.to_owned()),
-                CredAction::YankSecret => return clipboard::write(cred.secret.value(false)),
+                CredAction::ToggleEdit => {
+                    cred.toggle_edit();
+                    return Command::none();
+                },
+                CredAction::Hide => {
+                    cred.hidden = true;
+                    return Command::none();
+                },
+                CredAction::YankUsername => (clipboard::write::<Message>(cred.username.0.to_owned()), ("copied to clipboard", Status::Info)),
+                CredAction::YankSecret => (clipboard::write::<Message>(cred.secret.value(false)), ("copied to clipboard", Status::Info)),
                 CredAction::Delete => {
                     self.cred_list.remove(i as usize);
                     return self.update_repo(Some(action));
                 },
-                CredAction::DescriptionInput(_) | CredAction::SecretInput(_) | CredAction::UsernameInput(_) => cred.update(action),
-            }
+                CredAction::DescriptionInput(_) | CredAction::SecretInput(_) | CredAction::UsernameInput(_) => {
+                    cred.update(action);
+                    return Command::none();
+                }
+            };
+
+            self.toast(message, status);
+            command
         }
-        Command::none()
+        else {
+            Command::none()
+        }
+    }
+
+    fn update_store(&mut self, store_message: core::StoreMessage) {
+        match store_message {
+            core::StoreMessage::Added => self.toast("New credential added", Status::Success),
+            core::StoreMessage::Updated => self.toast("Credential updated", Status::Success),
+            core::StoreMessage::Deleted => self.toast("Credential deleted", Status::Success),
+            core::StoreMessage::Fetched(cred_list) => {
+                self.cred_list.extend(cred_list.into_iter().map(|cred| Cred::new_from_raw(cred.0, cred.1, cred.2)));
+                if self.cred_list.is_empty() {
+                    self.toast("Add new credential", Status::Info);
+                }
+            },
+            core::StoreMessage::Invalid => self.toast("Some error occurred", Status::Danger)
+        }
     }
 
     fn toast(&mut self, message: &str, status: Status) {
@@ -679,6 +700,9 @@ mod display_manager {
             widget::tree::Tag::of::<Marker>()
         }
 
+        /// Creates children for the elements in Display Manager.
+        /// 
+        /// **content** is iterated once and rest of the children are toasts
         fn diff(&self, tree: &mut Tree) {
             let instants = tree.state.downcast_mut::<Vec<Option<Instant>>>();
             instants.retain(Option::is_some);
@@ -707,12 +731,12 @@ mod display_manager {
 
         fn overlay<'b>(&'b mut self, state: &'b mut Tree, layout: Layout<'_>, renderer: &Renderer, translation: iced::Vector) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
             let instants = state.state.downcast_mut::<Vec<Option<Instant>>>();
-            let (content_state, toast_state) = state.children.split_at_mut(1);
+            let (content_state, state) = state.children.split_at_mut(1);
             let content = self.content.as_widget_mut().overlay(&mut content_state[0], layout, renderer, translation);
             let toasts = (!self.toasts.is_empty()).then(|| {
-                overlay::Element::new(Box::new(Overlay {
+                overlay::Element::new(Box::new(ToastOverlay {
                     toasts: &mut self.toasts,
-                    state: toast_state,
+                    state,
                     instants,
                     on_close: &self.on_close,
                 }))
@@ -728,14 +752,15 @@ mod display_manager {
         }
     }
 
-    struct Overlay<'a, 'b> {
+    /// An overlay for toasts
+    struct ToastOverlay<'a, 'b> {
         toasts: &'b mut [Element<'a, Message, Theme>],
         state: &'b mut [Tree],
         instants: &'b mut [Option<Instant>],
         on_close: &'b dyn Fn(usize) -> Message,
     }
 
-    impl<'a, 'b> overlay::Overlay<Message, Theme, Renderer> for Overlay<'a, 'b> {
+    impl<'a, 'b> overlay::Overlay<Message, Theme, Renderer> for ToastOverlay<'a, 'b> {
         fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
             let limits = layout::Limits::new(Size::ZERO, bounds);
             layout::flex::resolve(layout::flex::Axis::Vertical, renderer, &limits, Length::Fill, Length::Shrink, 10.into(), 10f32, Alignment::End, self.toasts, self.state).align(Alignment::End, Alignment::End, bounds)
@@ -803,7 +828,7 @@ mod display_manager {
 }
 
 mod theme {
-    use iced::{application, border::Radius, color, widget::{button, container, radio, text, text_editor, text_input}, Background, Border, Color};
+    use iced::{application, border::Radius, color, widget::{button, container::{self, Appearance}, radio, scrollable::{self, Scrollbar, Scroller}, text, text_editor, text_input}, Background, Border, Color};
 
     #[derive(Default)]
     pub struct Theme;
@@ -954,6 +979,41 @@ mod theme {
         
         fn disabled(&self, style: &Self::Style) -> text_input::Appearance {
             self.active(style)
+        }
+    }
+
+    impl scrollable::StyleSheet for Theme {
+        type Style = ();
+        
+        fn active(&self, _style: &Self::Style) -> scrollable::Appearance {
+            scrollable::Appearance {
+                container: Appearance {
+                    ..Default::default()
+                },
+                scrollbar: Scrollbar {
+                    background: None,
+                    border: Border::with_radius(1),
+                    scroller: Scroller {
+                        color: color!(176, 145, 16),
+                        border: Border::with_radius(5),
+                    }
+                },
+                gap: None,
+            }
+        }
+        
+        fn hovered(&self, style: &Self::Style, _is_mouse_over_scrollbar: bool,) -> scrollable::Appearance {
+            scrollable::Appearance {
+                scrollbar: Scrollbar {
+                    background: None,
+                    border: Border::with_radius(1),
+                    scroller: Scroller {
+                        color: Self::SECONDARY,
+                        border: Border::with_radius(5),
+                    }
+                },
+                ..self.active(style)
+            }
         }
     }
 
@@ -1202,7 +1262,7 @@ mod core {
 
     impl Pkcs7 {
         fn pad(block: &[u8], len: usize) -> Result<Vec<u8>, StoreError> {
-            if block.len() > 255 || len < block.len() {
+            if block.len() > u8::MAX as usize || len < block.len() {
                 Err(StoreError::PadError)
             }
             else {
